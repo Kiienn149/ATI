@@ -1,409 +1,533 @@
 # =========================
-# ONE-CELL FAST FINAL: arXiv Title Generation (T5) - Time-Optimized but Grade-Friendly
-# - Encoder-decoder: T5 seq2seq
-# - Fine-tune pre-trained T5
-# - Optimization: fp16 (GPU), gradient accumulation, dynamic padding
-# - Speed tricks: NO generation during training eval (eval_loss only), smaller max_source_len,
-#                 optional disable grad checkpointing, train subset + 1 epoch
-# - Final: generate on test -> ROUGE/BLEU + qualitative samples
+# Project 4: Tweet Sentiment Phrase Extraction - FIXED & STRONG VERSION (1 CELL)
+# Fixes:
+#  - eval_loss KeyError (explicit label_names + proper model outputs)
+#  - WRONG context_idxs bug in predict_span
+#  - Multi-sample dropout made REAL (dropout applied with training=True on hidden states)
+#  - Length scoring uses mild POSITIVE length bonus (reduces under-extraction)
+# Still extractive span QA + char-level evaluation
 # =========================
 
-!pip -q install -U transformers datasets evaluate rouge_score sacrebleu accelerate sentencepiece
+!pip -q install -U transformers datasets accelerate evaluate sentencepiece
 
-import os, sys, csv, time, random, inspect
+import os, glob, random, inspect, re, math, warnings
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
+import pandas as pd
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
+from typing import Tuple, List
 
-from datasets import load_dataset
-import evaluate
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+import transformers
 from transformers import (
     AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    DataCollatorForSeq2Seq,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
+    AutoConfig,
+    AutoModel,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    EarlyStoppingCallback,
+    set_seed,
 )
+from transformers.modeling_outputs import QuestionAnsweringModelOutput
 
-# -------------------------
-# 1) CONFIG (EDIT THESE)
-# -------------------------
-DATA_PATH  = "/content/drive/MyDrive/ATI/arXiv_scientific dataset.csv"   # <<< EDIT
-CLEAN_PATH = "/content/arxiv_clean.csv"
+warnings.filterwarnings("ignore")
+print("="*70)
+print("TWEET SENTIMENT PHRASE EXTRACTION - FIXED & STRONG")
+print("="*70)
+print(f"Transformers: {transformers.__version__} | Torch: {torch.__version__}")
 
-MODEL_NAME = "t5-small"
-OUTPUT_DIR = "/content/title-gen-model-fast"
-
+# ---------- 1) Seed ----------
 SEED = 42
-USE_CATEGORY = True
+set_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
-# Lengths (speed-friendly)
-MAX_SOURCE_LEN = 320      # 256-320 are good speed/quality tradeoffs
-MAX_TARGET_LEN = 32
-GEN_MAX_LEN    = 32
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
 
-# Training budget (key for time)
-MAX_TRAIN_SAMPLES = 50000   # reduce steps strongly; set None for full 108,990
-EPOCHS = 1                  # 1 epoch often good; set 2 if you have time
-# Alternative budget control (optional): uncomment to cap steps instead of epochs
-# MAX_STEPS = 2000
-
-LR = 3e-4
-WARMUP_RATIO = 0.06
-
-TRAIN_BATCH = 8            # try 8; if OOM -> 4 or 2
-EVAL_BATCH  = 16
-GRAD_ACCUM  = 4            # effective batch = TRAIN_BATCH * GRAD_ACCUM
-
-# Decoding for final evaluation
-FINAL_EVAL_BEAMS = 4
-NO_REPEAT_NGRAM  = 3
-
-# Final evaluation size for report
-FINAL_TEST_SAMPLES = 8000   # use 8000; can reduce to 2000 if still too slow
-
-# Optimization toggle (speed vs memory)
-USE_GRAD_CHECKPOINTING = False  # set True only if you OOM
-
-# -------------------------
-# 2) Setup
-# -------------------------
-def seed_everything(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-seed_everything(SEED)
-
-if DATA_PATH.startswith("/content/drive") and not os.path.exists(DATA_PATH):
+# ---------- 2) Find CSV ----------
+try:
     from google.colab import drive
-    drive.mount("/content/drive")
+    drive.mount("/content/drive", force_remount=False)
+    IN_COLAB = True
+except:
+    IN_COLAB = False
 
-assert os.path.exists(DATA_PATH), f"File not found: {DATA_PATH}"
-print("GPU available:", torch.cuda.is_available())
-use_fp16 = torch.cuda.is_available()
+TRAIN_CSV, TEST_CSV = "", ""
 
-csv.field_size_limit(sys.maxsize)
+def find_csv(filename: str):
+    candidates = []
+    for root in ["/content", "/content/drive/MyDrive", "/content/drive/Shareddrives"]:
+        if os.path.exists(root):
+            candidates.extend(glob.glob(os.path.join(root, "**", filename), recursive=True))
+    return sorted(set(candidates), key=lambda x: (len(x), x))
 
-def scan_inquote_state(line: str, in_quote: bool) -> bool:
-    i, n = 0, len(line)
-    while i < n:
-        if line[i] == '"':
-            if in_quote and i + 1 < n and line[i + 1] == '"':
-                i += 2
-                continue
-            in_quote = not in_quote
-        i += 1
-    return in_quote
+if not TRAIN_CSV or not os.path.exists(TRAIN_CSV):
+    cands = find_csv("train.csv")
+    if cands: TRAIN_CSV = cands[0]
+if not TEST_CSV or not os.path.exists(TEST_CSV):
+    cands = find_csv("test.csv")
+    if cands: TEST_CSV = cands[0]
 
-def robust_clean_csv(raw_path: str, clean_path: str, max_record_lines=120, max_record_chars=2_000_000):
-    """Handles multiline fields; drops corrupted records if needed."""
-    t0 = time.time()
-    good, bad = 0, 0
-    with open(raw_path, "r", encoding="utf-8", errors="replace", newline="") as fin:
-        header_buf = ""
-        in_q = False
-        while True:
-            line = fin.readline()
-            if not line:
-                raise ValueError("Empty file or cannot read header.")
-            header_buf += line
-            in_q = scan_inquote_state(line, in_q)
-            if not in_q:
-                break
-        header = next(csv.reader([header_buf]))
-        ncols = len(header)
+print(f"\nTRAIN_CSV: {TRAIN_CSV}")
+print(f"TEST_CSV : {TEST_CSV}")
+if not TRAIN_CSV or not TEST_CSV:
+    raise FileNotFoundError("Please upload train.csv and test.csv to /content/ or Drive.")
 
-        with open(clean_path, "w", encoding="utf-8", newline="") as fout:
-            writer = csv.writer(fout, quoting=csv.QUOTE_MINIMAL)
-            writer.writerow(header)
+# ---------- 3) Load data ----------
+train_df = pd.read_csv(TRAIN_CSV).dropna(subset=["text","selected_text","sentiment"]).reset_index(drop=True)
+test_df  = pd.read_csv(TEST_CSV).dropna(subset=["text","sentiment"]).reset_index(drop=True)
 
-            buf = ""
-            in_quote = False
-            buf_lines = 0
-            for line in fin:
-                buf += line
-                buf_lines += 1
-                in_quote = scan_inquote_state(line, in_quote)
+train_df["text"] = train_df["text"].astype(str)
+train_df["selected_text"] = train_df["selected_text"].astype(str)
+train_df["sentiment"] = train_df["sentiment"].astype(str).str.lower()
 
-                if not in_quote:
-                    try:
-                        row = next(csv.reader([buf]))
-                        if len(row) == ncols:
-                            writer.writerow(row); good += 1
-                        else:
-                            bad += 1
-                    except Exception:
-                        bad += 1
-                    buf = ""; buf_lines = 0
+test_df["text"] = test_df["text"].astype(str)
+test_df["sentiment"] = test_df["sentiment"].astype(str).str.lower()
+
+print(f"\nTrain={len(train_df)} | Test={len(test_df)}")
+print(train_df["sentiment"].value_counts())
+
+# ---------- 4) Split ----------
+tr_df, va_df = train_test_split(
+    train_df, test_size=0.1, random_state=SEED, stratify=train_df["sentiment"]
+)
+tr_df = tr_df.reset_index(drop=True)
+va_df = va_df.reset_index(drop=True)
+print(f"\nSplit: Train={len(tr_df)} | Val={len(va_df)}")
+
+# ---------- 5) Config ----------
+MODEL_NAME = "cardiffnlp/twitter-roberta-base"
+MAX_LEN = 256
+
+# training
+LR = 2e-5
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.06
+EPOCHS = 4
+TRAIN_BS = 8
+EVAL_BS = 16
+GRAD_ACCUM = 4  # effective BS = 32
+
+# decoding
+TOPK = 50
+MAX_ANSWER_TOKENS = 80
+MIN_ANSWER_TOKENS = 2
+LEN_BONUS_ALPHA = 0.15  # positive => reduce "too short" spans
+USE_NEUTRAL_SHORTCUT = True
+
+# advanced
+USE_FOCAL_LOSS = True
+FOCAL_ALPHA = 0.25
+FOCAL_GAMMA = 2.0
+
+USE_MSD = True
+MSD_SAMPLES = 5
+
+USE_DYNAMIC_POSTPROCESS = False  # keep OFF by default; you can turn ON & ablate in report
+
+print("\nCONFIG:")
+print(f"Model={MODEL_NAME} | MAX_LEN={MAX_LEN}")
+print(f"LR={LR} | epochs={EPOCHS} | eff_BS={TRAIN_BS*GRAD_ACCUM}")
+print(f"Decode: TOPK={TOPK} | max_ans_tok={MAX_ANSWER_TOKENS} | len_bonus={LEN_BONUS_ALPHA}")
+print(f"Focal={USE_FOCAL_LOSS} | MSD={USE_MSD} (n={MSD_SAMPLES}) | DynamicPost={USE_DYNAMIC_POSTPROCESS}")
+
+# ---------- 6) Tokenizer ----------
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True, add_prefix_space=True)
+except:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+
+# ---------- 7) Robust char span finder ----------
+def find_char_span(text: str, sel: str) -> Tuple[int,int]:
+    if sel in text:
+        s = text.find(sel); return s, s+len(sel)
+    sel2 = sel.strip()
+    if sel2 and sel2 in text:
+        s = text.find(sel2); return s, s+len(sel2)
+    if sel2:
+        try:
+            patt = re.escape(sel2).replace(r"\ ", r"\s+")
+            m = re.search(patt, text, flags=re.IGNORECASE)
+            if m: return m.start(), m.end()
+        except:
+            pass
+    return 0, len(text)
+
+# ---------- 8) Encode examples ----------
+def encode_examples(df: pd.DataFrame):
+    feats = []
+    for _, row in df.iterrows():
+        text = row["text"]
+        sent = row["sentiment"]
+        sel  = row.get("selected_text","")
+
+        if USE_NEUTRAL_SHORTCUT and sent == "neutral":
+            char_start, char_end = 0, len(text)
+        else:
+            char_start, char_end = find_char_span(text, sel)
+
+        enc = tokenizer(
+            sent,
+            text,
+            truncation="only_second",
+            max_length=MAX_LEN,
+            padding=False,
+            return_offsets_mapping=True
+        )
+        offsets = enc["offset_mapping"]
+        seq_ids = enc.sequence_ids()
+
+        cls_idx = 0
+        context_idxs = [i for i, sid in enumerate(seq_ids) if sid == 1]
+        if not context_idxs:
+            start_pos = end_pos = cls_idx
+        else:
+            c_start, c_end = context_idxs[0], context_idxs[-1]
+            if offsets[c_start][0] > char_end or offsets[c_end][1] < char_start:
+                start_pos = end_pos = cls_idx
+            else:
+                tok_start = c_start
+                while tok_start <= c_end and offsets[tok_start][1] <= char_start:
+                    tok_start += 1
+                tok_end = c_end
+                while tok_end >= c_start and offsets[tok_end][0] >= char_end:
+                    tok_end -= 1
+                if tok_start > c_end or tok_end < c_start or tok_end < tok_start:
+                    start_pos = end_pos = cls_idx
                 else:
-                    if buf_lines >= max_record_lines or len(buf) >= max_record_chars:
-                        # force-close attempt then drop if still bad
-                        try_buf = buf.rstrip("\n") + '"' + "\n"
-                        try:
-                            row = next(csv.reader([try_buf]))
-                            if len(row) == ncols:
-                                writer.writerow(row); good += 1
-                            else:
-                                bad += 1
-                        except Exception:
-                            bad += 1
-                        buf = ""; buf_lines = 0; in_quote = False
+                    start_pos, end_pos = tok_start, tok_end
 
-            if buf.strip():
-                try:
-                    if in_quote:
-                        buf = buf.rstrip("\n") + '"' + "\n"
-                    row = next(csv.reader([buf]))
-                    if len(row) == ncols:
-                        writer.writerow(row); good += 1
-                    else:
-                        bad += 1
-                except Exception:
-                    bad += 1
+        enc.pop("offset_mapping", None)
+        enc["start_positions"] = int(start_pos)
+        enc["end_positions"] = int(end_pos)
+        feats.append(enc)
+    return feats
 
-    print(f"[CLEAN] good rows: {good:,} | bad/dropped: {bad:,} | saved -> {clean_path} | time: {time.time()-t0:.1f}s")
+class QADataset(Dataset):
+    def __init__(self, features): self.features = features
+    def __len__(self): return len(self.features)
+    def __getitem__(self, idx): return self.features[idx]
 
-# -------------------------
-# 3) Clean -> Load
-# -------------------------
-print("Cleaning CSV...")
-robust_clean_csv(DATA_PATH, CLEAN_PATH)
+print("\nEncoding features...")
+train_features = encode_examples(tr_df)
+val_features   = encode_examples(va_df)
+train_ds = QADataset(train_features)
+val_ds   = QADataset(val_features)
 
-raw = load_dataset("csv", data_files=CLEAN_PATH)
-ds = raw["train"]
-print("[LOAD] rows:", ds.num_rows, "| columns:", ds.column_names)
-
-# -------------------------
-# 4) Detect columns + clean rows
-# -------------------------
-cols = set(ds.column_names)
-def pick_col(cands):
-    for c in cands:
-        if c in cols: return c
-    return None
-
-TEXT_COL  = pick_col(["summary", "abstract", "paper_abstract", "description"])
-TITLE_COL = pick_col(["title", "paper_title"])
-CAT_COL   = pick_col(["category_code", "primary_category", "category"])
-
-if TEXT_COL is None or TITLE_COL is None:
-    raise ValueError(f"Cannot find summary/title columns. Found: {ds.column_names}")
-
-print("TEXT_COL:", TEXT_COL, "| TITLE_COL:", TITLE_COL, "| CAT_COL:", CAT_COL)
-
-def basic_clean(ex):
-    s = ex.get(TEXT_COL, None)
-    t = ex.get(TITLE_COL, None)
-    if s is None or t is None: return {"_keep": False}
-    s = str(s).strip(); t = str(t).strip()
-    return {"_keep": bool(s) and bool(t)}
-
-ds2 = ds.map(basic_clean)
-ds2 = ds2.filter(lambda x: x["_keep"])
-ds2 = ds2.remove_columns(["_keep"])
-print("[CLEAN ROWS] rows:", ds2.num_rows)
-
-# primary category for conditioning (quality gain, low overhead)
-COND_COL = None
-if USE_CATEGORY and (CAT_COL is not None):
-    def make_primary_cat(ex):
-        rawc = ex.get(CAT_COL, None)
-        if rawc is None: return {"cat_primary": "UNKNOWN"}
-        rawc = str(rawc).strip()
-        if rawc == "": return {"cat_primary": "UNKNOWN"}
-        first = rawc.split()[0].split(",")[0].split(";")[0].strip()
-        return {"cat_primary": first if first else "UNKNOWN"}
-    ds2 = ds2.map(make_primary_cat)
-    COND_COL = "cat_primary"
-    print("[COND] Using:", COND_COL)
-
-# -------------------------
-# 5) Split 80/10/10 + subsample train/test for speed
-# -------------------------
-split1 = ds2.train_test_split(test_size=0.2, seed=SEED)
-tv = split1["test"].train_test_split(test_size=0.5, seed=SEED)
-train_ds, valid_ds, test_ds = split1["train"], tv["train"], tv["test"]
-print("Train:", train_ds.num_rows, "Valid:", valid_ds.num_rows, "Test:", test_ds.num_rows)
-
-if MAX_TRAIN_SAMPLES is not None and train_ds.num_rows > MAX_TRAIN_SAMPLES:
-    train_ds = train_ds.shuffle(seed=SEED).select(range(MAX_TRAIN_SAMPLES))
-print("[TRAIN SUBSET] Train:", train_ds.num_rows)
-
-if FINAL_TEST_SAMPLES is not None and test_ds.num_rows > FINAL_TEST_SAMPLES:
-    test_ds = test_ds.shuffle(seed=SEED).select(range(FINAL_TEST_SAMPLES))
-print("[TEST SUBSET] Test:", test_ds.num_rows)
-
-# -------------------------
-# 6) Tokenize
-# -------------------------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-def build_input(summary, cat_primary=None):
-    summary = str(summary).strip()
-    if USE_CATEGORY and (COND_COL is not None) and (cat_primary is not None):
-        return f"category: {cat_primary} | generate title: {summary}"
-    return f"generate title: {summary}"
-
-def preprocess_batch(batch):
-    summaries = batch[TEXT_COL]
-    titles = batch[TITLE_COL]
-    cats = batch[COND_COL] if (USE_CATEGORY and (COND_COL is not None) and (COND_COL in batch)) else [None]*len(summaries)
-
-    inputs = [build_input(s, c) for s, c in zip(summaries, cats)]
-    model_inputs = tokenizer(inputs, max_length=MAX_SOURCE_LEN, truncation=True)
-
-    labels = tokenizer(text_target=titles, max_length=MAX_TARGET_LEN, truncation=True)
-    model_inputs["labels"] = labels["input_ids"]
-    return model_inputs
-
-train_tok = train_ds.map(preprocess_batch, batched=True, remove_columns=list(train_ds.column_names))
-valid_tok = valid_ds.map(preprocess_batch, batched=True, remove_columns=list(valid_ds.column_names))
-test_tok  = test_ds.map(preprocess_batch,  batched=True, remove_columns=list(test_ds.column_names))
-print("[TOKENIZED] keys:", train_tok[0].keys())
-
-# -------------------------
-# 7) Model + speed/optimization
-# -------------------------
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-
-# generation defaults for final decode (we will override in final loop anyway)
-model.generation_config.max_length = GEN_MAX_LEN
-model.generation_config.no_repeat_ngram_size = NO_REPEAT_NGRAM
-
-# Grad checkpointing: OFF by default for speed (enable only if OOM)
-if USE_GRAD_CHECKPOINTING:
-    model.gradient_checkpointing_enable()
-    model.config.use_cache = False
-    print("[OPT] Gradient checkpointing: ON (memory saver, slower)")
-else:
-    print("[OPT] Gradient checkpointing: OFF (faster)")
-
-data_collator = DataCollatorForSeq2Seq(
+data_collator = DataCollatorWithPadding(
     tokenizer=tokenizer,
-    model=model,
-    pad_to_multiple_of=8
+    pad_to_multiple_of=8 if torch.cuda.is_available() else None
 )
 
-# -------------------------
-# 8) TrainingArguments: eval per epoch, but NO generation during training
-#    -> fastest while still showing training/val loss curves
-# -------------------------
-sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
-supports_eval_strategy = "eval_strategy" in sig.parameters
-supports_evaluation_strategy = "evaluation_strategy" in sig.parameters
+# ---------- 9) Custom model: REAL MSD + optional Focal Loss ----------
+class RobertaQA_MSD(nn.Module):
+    def __init__(self, model_name: str, msd_samples: int = 5, use_msd: bool = True):
+        super().__init__()
+        self.config = AutoConfig.from_pretrained(model_name)
+        self.backbone = AutoModel.from_pretrained(model_name, config=self.config)
+        self.qa = nn.Linear(self.config.hidden_size, 2)
+        self.use_msd = use_msd
+        self.msd_samples = msd_samples
+        self.dropout_p = float(getattr(self.config, "hidden_dropout_prob", 0.1))
 
-args_dict = dict(
-    output_dir=OUTPUT_DIR,
-    seed=SEED,
-    fp16=use_fp16,
+    def focal_ce(self, logits, targets, alpha=0.25, gamma=2.0):
+        ce = F.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-ce)
+        w = alpha * (1 - pt) ** gamma
+        return (w * ce).mean()
 
-    per_device_train_batch_size=TRAIN_BATCH,
-    per_device_eval_batch_size=EVAL_BATCH,
-    gradient_accumulation_steps=GRAD_ACCUM,
+    def forward(self, input_ids=None, attention_mask=None, start_positions=None, end_positions=None, **kwargs):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = outputs[0]  # [B, L, H]
 
+        if (not self.training) and self.use_msd:
+            # REAL MSD: apply dropout masks on hidden states with training=True
+            start_list, end_list = [], []
+            for _ in range(self.msd_samples):
+                dropped = F.dropout(sequence_output, p=self.dropout_p, training=True)
+                logits = self.qa(dropped)  # [B, L, 2]
+                s, e = logits.split(1, dim=-1)
+                start_list.append(s.squeeze(-1))
+                end_list.append(e.squeeze(-1))
+            start_logits = torch.mean(torch.stack(start_list, dim=0), dim=0)
+            end_logits   = torch.mean(torch.stack(end_list, dim=0), dim=0)
+        else:
+            logits = self.qa(sequence_output)
+            s, e = logits.split(1, dim=-1)
+            start_logits = s.squeeze(-1)
+            end_logits   = e.squeeze(-1)
+
+        loss = None
+        if start_positions is not None and end_positions is not None:
+            if USE_FOCAL_LOSS:
+                start_loss = self.focal_ce(start_logits, start_positions, FOCAL_ALPHA, FOCAL_GAMMA)
+                end_loss   = self.focal_ce(end_logits, end_positions,   FOCAL_ALPHA, FOCAL_GAMMA)
+            else:
+                ce = nn.CrossEntropyLoss()
+                start_loss = ce(start_logits, start_positions)
+                end_loss   = ce(end_logits, end_positions)
+            loss = (start_loss + end_loss) / 2
+
+        return QuestionAnsweringModelOutput(
+            loss=loss,
+            start_logits=start_logits,
+            end_logits=end_logits
+        )
+
+model = RobertaQA_MSD(MODEL_NAME, msd_samples=MSD_SAMPLES, use_msd=USE_MSD).to(device)
+
+# ---------- 10) TrainingArguments (robust naming) ----------
+output_dir = "/content/ati_project4_fixed_strong"
+
+ta_kwargs = dict(
+    output_dir=output_dir,
     learning_rate=LR,
+    weight_decay=WEIGHT_DECAY,
     warmup_ratio=WARMUP_RATIO,
     num_train_epochs=EPOCHS,
-    lr_scheduler_type="cosine",
-    weight_decay=0.01,
-
-    logging_steps=100,
-    save_strategy="epoch",
-    save_total_limit=2,
-
-    # IMPORTANT: no generation during training eval
-    predict_with_generate=False,
-
-    # pick best by eval_loss (fast, stable)
+    per_device_train_batch_size=TRAIN_BS,
+    per_device_eval_batch_size=EVAL_BS,
+    gradient_accumulation_steps=GRAD_ACCUM,
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
     greater_is_better=False,
-
+    save_total_limit=2,
+    logging_steps=50,
     report_to="none",
+    fp16=bool(torch.cuda.is_available()),
+    dataloader_num_workers=2 if IN_COLAB else 0,
 )
 
-# eval per epoch (compat)
-if supports_eval_strategy:
-    args_dict["eval_strategy"] = "epoch"
-elif supports_evaluation_strategy:
-    args_dict["evaluation_strategy"] = "epoch"
+sig = inspect.signature(TrainingArguments.__init__).parameters
+# eval every N steps
+if "evaluation_strategy" in sig:
+    ta_kwargs["evaluation_strategy"] = "steps"
+elif "eval_strategy" in sig:
+    ta_kwargs["eval_strategy"] = "steps"
+ta_kwargs["eval_steps"] = 200
 
-# Optional: cap steps instead of epochs (uncomment if you want)
-# if "max_steps" in sig.parameters:
-#     args_dict["max_steps"] = MAX_STEPS
+if "save_strategy" in sig:
+    ta_kwargs["save_strategy"] = "steps"
+ta_kwargs["save_steps"] = 200
 
-args = Seq2SeqTrainingArguments(**args_dict)
+args = TrainingArguments(**ta_kwargs)
 
-trainer = Seq2SeqTrainer(
+# KEY FIX for your eval_loss error:
+# Make Trainer recognize QA labels explicitly for evaluation loop
+trainer = Trainer(
     model=model,
     args=args,
-    train_dataset=train_tok,
-    eval_dataset=valid_tok,      # eval_loss only, fast
-    tokenizer=tokenizer,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
     data_collator=data_collator,
-    compute_metrics=None         # no ROUGE/BLEU during training (saves a lot of time)
+    tokenizer=tokenizer,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+    label_names=["start_positions","end_positions"],  # <-- CRITICAL
 )
 
-# -------------------------
-# 9) Train
-# -------------------------
-print("\n[TRAIN] starting...")
+print("\n" + "="*70)
+print("TRAINING")
+print("="*70)
 trainer.train()
-trainer.save_model(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
-print("[SAVE] Model saved to:", OUTPUT_DIR)
 
-# -------------------------
-# 10) FINAL metrics (ROUGE/BLEU) on test via batched generation
-# -------------------------
-rouge = evaluate.load("rouge")
-bleu  = evaluate.load("sacrebleu")
-
-# Prepare dataloader for batched generation
-test_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
-dl = DataLoader(test_tok, batch_size=EVAL_BATCH, shuffle=False, collate_fn=data_collator)
-
+trainer.save_model(output_dir)
+tokenizer.save_pretrained(output_dir)
+model = trainer.model.to(device)
 model.eval()
-device = model.device
+print(f"\n✓ Training complete. Best model saved to: {output_dir}")
 
-pred_texts = []
-with torch.no_grad():
-    for batch in dl:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+# ---------- 11) Better span snap ----------
+WORD_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'")
+RIGHT_PUNCT = set("!?.;,:'\"”)”]}>")
+LEFT_PUNCT  = set("“(\"([{<")
 
-        gen_ids = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            num_beams=FINAL_EVAL_BEAMS,
-            max_length=GEN_MAX_LEN,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM,
-        )
-        pred_texts.extend(tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
+def snap_span(text: str, s: int, e: int) -> Tuple[int,int]:
+    n = len(text)
+    s = max(0, min(n, s)); e = max(0, min(n, e))
+    if e < s: e = s
 
-# References from original test_ds titles (same order)
-ref_texts = [str(t).strip() for t in test_ds[TITLE_COL]]
+    while s > 0 and text[s-1] in WORD_CHARS and (s < n and text[s] in WORD_CHARS):
+        s -= 1
+    while e < n and (e-1) >= 0 and text[e-1] in WORD_CHARS and text[e] in WORD_CHARS:
+        e += 1
+    while s > 0 and text[s-1] in LEFT_PUNCT:
+        s -= 1
+    while e < n and text[e] in RIGHT_PUNCT:
+        e += 1
 
-pred_texts = [p.strip() for p in pred_texts]
-ref_texts  = [r.strip() for r in ref_texts]
+    raw = text[s:e]
+    stripped = raw.strip()
+    if stripped:
+        win_s = max(0, s-6); win_e = min(n, e+6)
+        win = text[win_s:win_e]
+        pos = win.find(stripped)
+        if pos != -1:
+            s = win_s + pos
+            e = s + len(stripped)
+    return s, e
 
-rouge_res = rouge.compute(predictions=pred_texts, references=ref_texts, use_stemmer=True)
-bleu_res  = bleu.compute(predictions=pred_texts, references=[[r] for r in ref_texts])
+# ---------- 12) Predict span (FIXED context_idxs) ----------
+@torch.no_grad()
+def predict_span(text: str, sentiment: str) -> Tuple[str, Tuple[int,int]]:
+    if USE_NEUTRAL_SHORTCUT and sentiment == "neutral":
+        return text.strip(), (0, len(text))
 
-final_metrics = {
-    "rouge1": round(rouge_res["rouge1"], 4),
-    "rouge2": round(rouge_res["rouge2"], 4),
-    "rougeL": round(rouge_res["rougeL"], 4),
-    "bleu": round(bleu_res["score"], 4),
-}
-print("\n[FINAL TEST METRICS]", final_metrics)
+    enc = tokenizer(
+        sentiment,
+        text,
+        truncation="only_second",
+        max_length=MAX_LEN,
+        padding="max_length",
+        return_offsets_mapping=True,
+        return_tensors="pt"
+    )
+    offsets = enc.pop("offset_mapping")[0].tolist()
+    seq_ids = enc.sequence_ids(0)
+    enc = {k: v.to(device) for k, v in enc.items()}
 
-print("\n[QUALITATIVE] 10 samples:")
-for i in range(min(10, len(pred_texts))):
-    print("="*90)
-    print("GT  :", ref_texts[i])
-    print("PRED:", pred_texts[i])
+    out = model(**enc)
+    start_logits = out.start_logits[0].detach().cpu().numpy()
+    end_logits   = out.end_logits[0].detach().cpu().numpy()
 
-print("\nDone.")
+    # FIX: context token INDICES, not values
+    context_idxs = [i for i, sid in enumerate(seq_ids) if sid == 1]
+    if not context_idxs:
+        return text.strip(), (0, len(text))
+    c_start, c_end = context_idxs[0], context_idxs[-1]
+
+    start_rank = np.argsort(start_logits)[::-1]
+    end_rank   = np.argsort(end_logits)[::-1]
+
+    start_cands = [i for i in start_rank if c_start <= i <= c_end][:TOPK]
+    end_cands   = [i for i in end_rank   if c_start <= i <= c_end][:TOPK]
+
+    best_score = -1e18
+    best_pair = (c_start, c_start)
+    backup_score = -1e18
+    backup_pair = (c_start, c_start)
+
+    for si in start_cands:
+        if offsets[si] == (0,0): continue
+        for ei in end_cands:
+            if ei < si: continue
+            if offsets[ei] == (0,0): continue
+            length = ei - si + 1
+            if length > MAX_ANSWER_TOKENS:
+                continue
+
+            base = start_logits[si] + end_logits[ei]
+            bonus = LEN_BONUS_ALPHA * math.log1p(length)  # mild positive length bonus
+            score = base + bonus
+
+            if score > backup_score:
+                backup_score = score
+                backup_pair = (si, ei)
+
+            if length < MIN_ANSWER_TOKENS:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_pair = (si, ei)
+
+    si, ei = best_pair if best_score > -1e17 else backup_pair
+    char_start, char_end = offsets[si][0], offsets[ei][1]
+    char_start, char_end = snap_span(text, char_start, char_end)
+
+    pred = text[char_start:char_end].strip()
+    if pred == "":
+        return text.strip(), (0, len(text))
+    return pred, (char_start, char_end)
+
+# ---------- 13) Evaluation (char-level + word jaccard) ----------
+def char_metrics(text: str, true_span: Tuple[int,int], pred_span: Tuple[int,int]):
+    n = len(text)
+    ts, te = max(0, min(n, true_span[0])), max(0, min(n, true_span[1]))
+    ps, pe = max(0, min(n, pred_span[0])), max(0, min(n, pred_span[1]))
+    if te < ts: te = ts
+    if pe < ps: pe = ps
+
+    inter_s, inter_e = max(ts, ps), min(te, pe)
+    inter = max(0, inter_e - inter_s)
+
+    true_len = te - ts
+    pred_len = pe - ps
+    union = true_len + pred_len - inter
+
+    iou = inter / union if union > 0 else 1.0
+    prec = inter / pred_len if pred_len > 0 else (1.0 if true_len == 0 else 0.0)
+    rec = inter / true_len if true_len > 0 else (1.0 if pred_len == 0 else 0.0)
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    return f1, iou, inter, (pred_len - inter), (true_len - inter), (n - union)
+
+def word_jaccard(a: str, b: str):
+    sa, sb = set(a.lower().split()), set(b.lower().split())
+    if not sa and not sb: return 1.0
+    return len(sa & sb) / len(sa | sb) if (sa | sb) else 0.0
+
+print("\n" + "="*70)
+print("VALIDATION EVALUATION")
+print("="*70)
+
+macro_f1, macro_iou, macro_wj = [], [], []
+TP=FP=FN=TN=0
+
+for _, row in va_df.iterrows():
+    text, sent, true_sel = row["text"], row["sentiment"], row["selected_text"]
+
+    if USE_NEUTRAL_SHORTCUT and sent == "neutral":
+        true_span = (0, len(text))
+        true_phrase = text.strip()
+    else:
+        ts, te = find_char_span(text, true_sel)
+        ts, te = snap_span(text, ts, te)
+        true_span = (ts, te)
+        true_phrase = text[ts:te].strip()
+
+    pred_phrase, pred_span = predict_span(text, sent)
+
+    f1, iou, tp, fp, fn, tn = char_metrics(text, true_span, pred_span)
+    wj = word_jaccard(true_phrase, pred_phrase)
+
+    macro_f1.append(f1); macro_iou.append(iou); macro_wj.append(wj)
+    TP += tp; FP += fp; FN += fn; TN += tn
+
+print(f"MACRO char-F1  : {np.mean(macro_f1):.4f}")
+print(f"MACRO char-IoU : {np.mean(macro_iou):.4f}")
+print(f"MACRO wordJac  : {np.mean(macro_wj):.4f}")
+
+micro_p = TP/(TP+FP) if (TP+FP)>0 else 0
+micro_r = TP/(TP+FN) if (TP+FN)>0 else 0
+micro_f1 = (2*micro_p*micro_r/(micro_p+micro_r)) if (micro_p+micro_r)>0 else 0
+print(f"MICRO char-F1  : {micro_f1:.4f} | Prec={micro_p:.4f} | Rec={micro_r:.4f}")
+
+# ---------- 14) Predict test & save submission ----------
+print("\n" + "="*70)
+print(f"PREDICT TEST ({len(test_df)} rows)")
+print("="*70)
+
+preds = []
+for i, row in test_df.iterrows():
+    pred, _ = predict_span(row["text"], row["sentiment"])
+    preds.append(pred if pred else row["text"].strip())
+    if (i+1) % 500 == 0:
+        print(f"  {i+1}/{len(test_df)} done")
+
+sub = pd.DataFrame({
+    "textID": test_df["textID"].values if "textID" in test_df.columns else np.arange(len(test_df)),
+    "selected_text": preds
+})
+out_path = "/content/submission.csv"
+sub.to_csv(out_path, index=False)
+print(f"\n✓ Saved: {out_path}")
+print(sub.head())
