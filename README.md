@@ -2,8 +2,8 @@
 
 **Course:** 62FIT4ATI – Deep Learning for NLP  
 **Topic:** Project 4 – Tweet Sentiment Phrase Extraction  
-**Group:** Group <YOUR_GROUP_NUMBER>  
-**Members:** <Name 1> – <Student ID 1>, <Name 2> – <Student ID 2>, ...
+**Group:** Group <11>  
+**Members:** <Nguyen Mai Phuong> – <2201140066>, <Nguyen Trung Kien> – <2201140042>, <Nguyen Xuan Huy> – <2201140036>
 
 ---
 
@@ -130,4 +130,4 @@ We submit:
 
 - YouTube video link: 
 
-- Notebook: https://colab.research.google.com/drive/18QcKcF_xF4its-r14N7Pu7iGe3BX5UI9?usp=sharing
+- Notebook: https://colab.research.google.com/drive/1YEZXZAiQplrhp39M2zhdL3qPXjg27VAO?usp=sharing
